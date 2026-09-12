@@ -26,6 +26,17 @@ Written as a block, the same expression becomes one shader, one submit, one wait
 Adding more operators to the block does not make it slower — the cost was the round
 trips, not the arithmetic.
 
+Since `mruby-gpu-narray` gained deferred submission (operators are recorded and submitted
+together when a result is read), the operator chain also waits only once — but it still
+makes four passes over memory. Fusion removes those too, which is where it keeps winning
+at scale:
+
+| Apple M5, 100-run mean | 1,024 elements | 1,048,576 elements |
+|---|---|---|
+| `a * 2 + 1 - 3 + 4`, one submit per operator (`GPU.sync_mode = :eager`) | 0.95 ms | 2.33 ms |
+| same chain, one submit for the batch (default) | 0.25 ms | 2.12 ms |
+| one traced kernel | 0.22 ms | 0.35 ms |
+
 ## How — tracing, not parsing
 
 mruby has no `RubyVM::AbstractSyntaxTree`, and driving the mruby parser from C to read a
@@ -187,17 +198,19 @@ it before this gem in `build_config.rb`.
 mrblib/gpu_kernel.rb   Expr / Codegen / KernelContext / GPU.kernel / NArray#map, #map2, #sum, #dot
    │                   block -> expression tree -> GLSL (statements for loops, an expression for the rest)
    ▼
-src/gpu_kernel.c       GPU::Kernel: glslangValidator -> SPIR-V -> VkPipeline -> dispatch (2 or 3 buffers)
+src/gpu_kernel.c       GPU::Kernel: glslangValidator -> SPIR-V -> VkPipeline -> dispatch_pipeline (2 or 3 buffers)
    │
    ├─ uses mruby-gpu-narray's g_ctx (device, queue, layouts, pools)
-   └─ uses its create_buffer / wrap_buffer / gpu_buffer_type
+   ├─ uses its create_buffer / wrap_buffer / gpu_buffer_type
+   └─ dispatches through its dispatch_pipeline() (same batch as the operators)
 ```
 
 This gem compiles against the base gem's `src/gpu_internal.h` and links against symbols
-it already exports, so **the base gem needs no changes**. The dispatch routine here is a
-copy of the base gem's `dispatch_compute()`: upstream's version is keyed to its internal
-`PipeId` enum and cannot bind a pipeline built elsewhere. When upstream grows a
-pipeline-taking variant, this copy should go away.
+it already exports. A kernel is dispatched through the base gem's `dispatch_pipeline()`,
+so it is recorded into the same deferred batch as the built-in operators: `a.map { … }`
+queues one dispatch, and nothing is submitted until a result is read. This needs a
+`mruby-gpu-narray` that exports `dispatch_pipeline()` (its `deferred-submit` branch or
+later).
 
 ## Verified on
 

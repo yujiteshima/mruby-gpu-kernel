@@ -10,10 +10,9 @@
  * (the result array, or the per-workgroup partials of a reduction), which is
  * exactly LAYOUT_2BUF / LAYOUT_3BUF, so no new descriptor plumbing is needed.
  *
- * The dispatch below duplicates the body of mruby-gpu-narray's
- * dispatch_compute(). Upstream's version is keyed to its PipeId enum and so
- * cannot bind a pipeline we built ourselves; when it grows a pipeline-taking
- * variant, this copy should go away.
+ * Dispatch goes through mruby-gpu-narray's dispatch_pipeline(), so a traced
+ * kernel joins the same deferred batch as the built-in operators: nothing is
+ * submitted until a result is read.
  *
  * We shell out to glslangValidator rather than linking glslang, so the link
  * dependency stays libvulkan only -- and the compiler is already required to
@@ -105,99 +104,6 @@ static VkPipeline pipeline_from_spv(const char *path, LayoutId lid) {
   }
   vkDestroyShaderModule(g_ctx.device, shader, NULL);
   return pipeline;
-}
-
-/* num_buffers storage buffers bound in order, { uint n } push constant.
- * Records, submits and waits; every failure releases what was created and
- * raises through gpu_check. */
-static void dispatch_kernel(mrb_state *mrb, VkPipeline pipeline, LayoutId lid,
-                            VkBuffer *buffers, VkDeviceSize *sizes, int num_buffers,
-                            uint32_t n, uint32_t groups) {
-  if (groups > g_ctx.max_workgroups) {
-    mrb_raisef(mrb, E_ARGUMENT_ERROR,
-      "array too large for one dispatch: %i workgroups needed, device allows %i",
-      (mrb_int)groups, (mrb_int)g_ctx.max_workgroups);
-  }
-
-  VkDescriptorSetAllocateInfo dsai = {
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-    .descriptorPool = g_ctx.desc_pool,
-    .descriptorSetCount = 1,
-    .pSetLayouts = &g_ctx.desc_layouts[lid]
-  };
-  VkDescriptorSet desc_set;
-  VK_CHECK(mrb, vkAllocateDescriptorSets(g_ctx.device, &dsai, &desc_set));
-
-  VkDescriptorBufferInfo buf_infos[3];
-  VkWriteDescriptorSet writes[3];
-  for (int i = 0; i < num_buffers; i++) {
-    buf_infos[i] = (VkDescriptorBufferInfo){buffers[i], 0, sizes[i]};
-    writes[i] = (VkWriteDescriptorSet){
-      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-      .dstSet = desc_set,
-      .dstBinding = i,
-      .descriptorCount = 1,
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      .pBufferInfo = &buf_infos[i]
-    };
-  }
-  vkUpdateDescriptorSets(g_ctx.device, num_buffers, writes, 0, NULL);
-
-  VkCommandBufferAllocateInfo cbai = {
-    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-    .commandPool = g_ctx.cmd_pool,
-    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-    .commandBufferCount = 1
-  };
-  VkCommandBuffer cmd;
-  VkResult r = vkAllocateCommandBuffers(g_ctx.device, &cbai, &cmd);
-  if (r != VK_SUCCESS) {
-    vkFreeDescriptorSets(g_ctx.device, g_ctx.desc_pool, 1, &desc_set);
-    gpu_check(mrb, r, "vkAllocateCommandBuffers");
-  }
-
-  VkCommandBufferBeginInfo begin = {
-    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-  };
-  VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  VkSubmitInfo si = {
-    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-    .commandBufferCount = 1,
-    .pCommandBuffers = &cmd
-  };
-  VkFence fence = VK_NULL_HANDLE;
-  const char *step = "vkBeginCommandBuffer";
-
-  r = vkBeginCommandBuffer(cmd, &begin);
-  if (r == VK_SUCCESS) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-      g_ctx.pipe_layouts[lid], 0, 1, &desc_set, 0, NULL);
-    vkCmdPushConstants(cmd, g_ctx.pipe_layouts[lid],
-      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &n);
-    vkCmdDispatch(cmd, groups, 1, 1);
-    step = "vkEndCommandBuffer";
-    r = vkEndCommandBuffer(cmd);
-  }
-  if (r == VK_SUCCESS) {
-    step = "vkCreateFence";
-    r = vkCreateFence(g_ctx.device, &fi, NULL, &fence);
-  }
-  if (r == VK_SUCCESS) {
-    step = "vkQueueSubmit";
-    r = vkQueueSubmit(g_ctx.queue, 1, &si, fence);
-  }
-  if (r == VK_SUCCESS) {
-    step = "vkWaitForFences";
-    r = vkWaitForFences(g_ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
-  }
-
-  if (fence != VK_NULL_HANDLE) vkDestroyFence(g_ctx.device, fence, NULL);
-  vkFreeCommandBuffers(g_ctx.device, g_ctx.cmd_pool, 1, &cmd);
-  vkFreeDescriptorSets(g_ctx.device, g_ctx.desc_pool, 1, &desc_set);
-
-  gpu_check(mrb, r, step);
 }
 
 /* ---- mruby surface ---- */
@@ -325,21 +231,16 @@ static mrb_value kernel_call(mrb_state *mrb, mrb_value self) {
   uint32_t n = in[0]->n;
   uint32_t groups = (n + 255) / 256;
   LayoutId lid = kernel_layout(k->inputs);
-  VkBuffer bufs[3];
-  VkDeviceSize sizes[3];
-  for (int i = 0; i < k->inputs; i++) {
-    bufs[i] = in[i]->buffer;
-    sizes[i] = in[i]->bytes;
-  }
+  GpuBuffer *bufs[3] = {in[0], in[1], NULL};   /* inputs, then the output */
 
   if (k->reduce == REDUCE_NONE) {
     GpuBuffer *out = create_buffer(mrb, n);
     /* Wrapped before dispatching: a Vulkan failure raises, and the GC can only
      * free what it owns. */
     mrb_value result = wrap_buffer(mrb, mrb_obj_class(mrb, args[0]), out);
-    bufs[k->inputs] = out->buffer;
-    sizes[k->inputs] = out->bytes;
-    dispatch_kernel(mrb, k->pipeline, lid, bufs, sizes, k->inputs + 1, n, groups);
+    bufs[k->inputs] = out;
+    dispatch_pipeline(mrb, k->pipeline, lid, bufs, k->inputs + 1, &n, sizeof(n),
+                      groups, 1, 1);
     return result;
   }
 
@@ -351,10 +252,11 @@ static mrb_value kernel_call(mrb_state *mrb, mrb_value self) {
   }
   GpuBuffer *partial = create_buffer(mrb, groups);
   wrap_buffer(mrb, mrb_obj_class(mrb, args[0]), partial);   /* GC-owned scratch */
-  bufs[k->inputs] = partial->buffer;
-  sizes[k->inputs] = partial->bytes;
-  dispatch_kernel(mrb, k->pipeline, lid, bufs, sizes, k->inputs + 1, n, groups);
+  bufs[k->inputs] = partial;
+  dispatch_pipeline(mrb, k->pipeline, lid, bufs, k->inputs + 1, &n, sizeof(n),
+                    groups, 1, 1);
 
+  /* map_buffer flushes the batch: the partials are its last dispatch. */
   float *pm = map_buffer(mrb, partial);
   double acc = (k->reduce == REDUCE_SUM) ? 0.0 : (double)pm[0];
   for (uint32_t i = 0; i < groups; i++) {

@@ -32,8 +32,11 @@ puts "  sqrt(abs(x))             = #{signal.map { |x| sqrt(abs(x)) }.inspect}"
 puts
 
 # ---- 3. why it is worth doing --------------------------------------------
-# Each operator is its own dispatch: a * 2 + 1 - 3 + 4 submits four times and
-# waits for the GPU four times. Traced into one kernel, it submits once.
+# Each operator is its own dispatch. With GPU.sync_mode = :eager that is also
+# a submit and a fence wait per operator; by default mruby-gpu-narray records
+# the four dispatches and submits them together when a result is read. The
+# traced kernel is one dispatch either way -- and one pass over memory instead
+# of four, which is what still matters once the arrays are large.
 def bench(iters)
   yield
   t0 = Time.now.to_f
@@ -48,10 +51,14 @@ end
 big = GPU::SFloat.new(1024).seq
 fused = GPU.kernel { |x| x * 2 + 1 - 3 + 4 }
 
-chained_ms = bench(100) { big * 2 + 1 - 3 + 4 }
-fused_ms   = bench(100) { fused.call(big) }
+GPU.sync_mode = :eager
+eager_ms    = bench(100) { big * 2 + 1 - 3 + 4 }
+GPU.sync_mode = :deferred
+deferred_ms = bench(100) { (big * 2 + 1 - 3 + 4); GPU.sync }
+fused_ms    = bench(100) { fused.call(big); GPU.sync }
 
 puts "-- four operators, 1024 elements --"
-puts "  a * 2 + 1 - 3 + 4      #{ms(chained_ms)} ms   (4 dispatches, 4 waits)"
+puts "  a * 2 + 1 - 3 + 4      #{ms(eager_ms)} ms   (4 dispatches, 4 waits -- GPU.sync_mode = :eager)"
+puts "  same, one batch        #{ms(deferred_ms)} ms   (4 dispatches, 1 wait)"
 puts "  one traced kernel      #{ms(fused_ms)} ms   (1 dispatch,  1 wait)"
-puts "  speedup                #{ms(chained_ms / fused_ms)}x"
+puts "  speedup                #{ms(eager_ms / fused_ms)}x over eager, #{ms(deferred_ms / fused_ms)}x over the batch"
