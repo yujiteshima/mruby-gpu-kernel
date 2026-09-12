@@ -1,4 +1,4 @@
-/* gpu_kernel.c -- element-wise kernels compiled at run time (GPU::Kernel).
+/* gpu_kernel.c -- kernels compiled at run time (GPU::Kernel).
  *
  * The Ruby side (mrblib/gpu_kernel.rb) traces a block into GLSL source. This
  * file takes that source, runs it through glslangValidator, builds a compute
@@ -6,8 +6,9 @@
  *
  * Everything here rides on mruby-gpu-narray: the Vulkan context (g_ctx), the
  * descriptor-set layouts, and the buffer helpers all come from its
- * gpu_internal.h. A traced kernel is one input buffer and one output buffer,
- * which is exactly LAYOUT_2BUF, so no new descriptor plumbing is needed.
+ * gpu_internal.h. A kernel is one or two input buffers plus one output buffer
+ * (the result array, or the per-workgroup partials of a reduction), which is
+ * exactly LAYOUT_2BUF / LAYOUT_3BUF, so no new descriptor plumbing is needed.
  *
  * The dispatch below duplicates the body of mruby-gpu-narray's
  * dispatch_compute(). Upstream's version is keyed to its PipeId enum and so
@@ -22,8 +23,13 @@
 #include <mruby/error.h>
 #include <unistd.h>
 
+/* Matches GPU::Kernel::REDUCE in mrblib/gpu_kernel.rb. */
+enum { REDUCE_NONE = 0, REDUCE_SUM = 1, REDUCE_MIN = 2, REDUCE_MAX = 3 };
+
 typedef struct {
   VkPipeline pipeline;
+  int inputs;   /* 1 or 2 input arrays */
+  int reduce;   /* REDUCE_NONE for element-wise, else how partials combine */
 } GpuKernel;
 
 static void kernel_free(mrb_state *mrb, void *p) {
@@ -38,6 +44,11 @@ static void kernel_free(mrb_state *mrb, void *p) {
 static const struct mrb_data_type gpu_kernel_type = {
   "GPU::Kernel", kernel_free
 };
+
+/* One input -> (a, out) is LAYOUT_2BUF; two inputs -> (a, b, out) is 3BUF. */
+static LayoutId kernel_layout(int inputs) {
+  return inputs == 2 ? LAYOUT_3BUF : LAYOUT_2BUF;
+}
 
 /* ---- file helpers ---- */
 
@@ -60,7 +71,7 @@ static uint8_t *read_file(const char *path, size_t *size) {
 
 /* ---- Vulkan ---- */
 
-static VkPipeline pipeline_from_spv(const char *path) {
+static VkPipeline pipeline_from_spv(const char *path, LayoutId lid) {
   size_t spv_size = 0;
   uint8_t *spv = read_file(path, &spv_size);
   if (!spv) return VK_NULL_HANDLE;
@@ -85,7 +96,7 @@ static VkPipeline pipeline_from_spv(const char *path) {
       .module = shader,
       .pName = "main"
     },
-    .layout = g_ctx.pipe_layouts[LAYOUT_2BUF]
+    .layout = g_ctx.pipe_layouts[lid]
   };
   VkPipeline pipeline = VK_NULL_HANDLE;
   if (vkCreateComputePipelines(g_ctx.device, VK_NULL_HANDLE, 1, &cp_info,
@@ -96,22 +107,30 @@ static VkPipeline pipeline_from_spv(const char *path) {
   return pipeline;
 }
 
-/* One input buffer, one output buffer, { uint n } push constant. */
-static void dispatch_kernel(VkPipeline pipeline,
-                            VkBuffer *buffers, VkDeviceSize *sizes,
+/* num_buffers storage buffers bound in order, { uint n } push constant.
+ * Records, submits and waits; every failure releases what was created and
+ * raises through gpu_check. */
+static void dispatch_kernel(mrb_state *mrb, VkPipeline pipeline, LayoutId lid,
+                            VkBuffer *buffers, VkDeviceSize *sizes, int num_buffers,
                             uint32_t n, uint32_t groups) {
+  if (groups > g_ctx.max_workgroups) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR,
+      "array too large for one dispatch: %i workgroups needed, device allows %i",
+      (mrb_int)groups, (mrb_int)g_ctx.max_workgroups);
+  }
+
   VkDescriptorSetAllocateInfo dsai = {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
     .descriptorPool = g_ctx.desc_pool,
     .descriptorSetCount = 1,
-    .pSetLayouts = &g_ctx.desc_layouts[LAYOUT_2BUF]
+    .pSetLayouts = &g_ctx.desc_layouts[lid]
   };
   VkDescriptorSet desc_set;
-  vkAllocateDescriptorSets(g_ctx.device, &dsai, &desc_set);
+  VK_CHECK(mrb, vkAllocateDescriptorSets(g_ctx.device, &dsai, &desc_set));
 
-  VkDescriptorBufferInfo buf_infos[2];
-  VkWriteDescriptorSet writes[2];
-  for (int i = 0; i < 2; i++) {
+  VkDescriptorBufferInfo buf_infos[3];
+  VkWriteDescriptorSet writes[3];
+  for (int i = 0; i < num_buffers; i++) {
     buf_infos[i] = (VkDescriptorBufferInfo){buffers[i], 0, sizes[i]};
     writes[i] = (VkWriteDescriptorSet){
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -122,7 +141,7 @@ static void dispatch_kernel(VkPipeline pipeline,
       .pBufferInfo = &buf_infos[i]
     };
   }
-  vkUpdateDescriptorSets(g_ctx.device, 2, writes, 0, NULL);
+  vkUpdateDescriptorSets(g_ctx.device, num_buffers, writes, 0, NULL);
 
   VkCommandBufferAllocateInfo cbai = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -131,41 +150,59 @@ static void dispatch_kernel(VkPipeline pipeline,
     .commandBufferCount = 1
   };
   VkCommandBuffer cmd;
-  vkAllocateCommandBuffers(g_ctx.device, &cbai, &cmd);
+  VkResult r = vkAllocateCommandBuffers(g_ctx.device, &cbai, &cmd);
+  if (r != VK_SUCCESS) {
+    vkFreeDescriptorSets(g_ctx.device, g_ctx.desc_pool, 1, &desc_set);
+    gpu_check(mrb, r, "vkAllocateCommandBuffers");
+  }
 
   VkCommandBufferBeginInfo begin = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
   };
-  vkBeginCommandBuffer(cmd, &begin);
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-    g_ctx.pipe_layouts[LAYOUT_2BUF], 0, 1, &desc_set, 0, NULL);
-  vkCmdPushConstants(cmd, g_ctx.pipe_layouts[LAYOUT_2BUF],
-    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &n);
-  vkCmdDispatch(cmd, groups, 1, 1);
-  vkEndCommandBuffer(cmd);
-
   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  VkFence fence;
-  vkCreateFence(g_ctx.device, &fi, NULL, &fence);
-
   VkSubmitInfo si = {
     .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
     .commandBufferCount = 1,
     .pCommandBuffers = &cmd
   };
-  vkQueueSubmit(g_ctx.queue, 1, &si, fence);
-  vkWaitForFences(g_ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+  VkFence fence = VK_NULL_HANDLE;
+  const char *step = "vkBeginCommandBuffer";
 
-  vkDestroyFence(g_ctx.device, fence, NULL);
+  r = vkBeginCommandBuffer(cmd, &begin);
+  if (r == VK_SUCCESS) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+      g_ctx.pipe_layouts[lid], 0, 1, &desc_set, 0, NULL);
+    vkCmdPushConstants(cmd, g_ctx.pipe_layouts[lid],
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &n);
+    vkCmdDispatch(cmd, groups, 1, 1);
+    step = "vkEndCommandBuffer";
+    r = vkEndCommandBuffer(cmd);
+  }
+  if (r == VK_SUCCESS) {
+    step = "vkCreateFence";
+    r = vkCreateFence(g_ctx.device, &fi, NULL, &fence);
+  }
+  if (r == VK_SUCCESS) {
+    step = "vkQueueSubmit";
+    r = vkQueueSubmit(g_ctx.queue, 1, &si, fence);
+  }
+  if (r == VK_SUCCESS) {
+    step = "vkWaitForFences";
+    r = vkWaitForFences(g_ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+  }
+
+  if (fence != VK_NULL_HANDLE) vkDestroyFence(g_ctx.device, fence, NULL);
   vkFreeCommandBuffers(g_ctx.device, g_ctx.cmd_pool, 1, &cmd);
   vkFreeDescriptorSets(g_ctx.device, g_ctx.desc_pool, 1, &desc_set);
+
+  gpu_check(mrb, r, step);
 }
 
 /* ---- mruby surface ---- */
 
-/* GPU::Kernel.compile(glsl_source) -> GPU::Kernel
+/* GPU::Kernel.compile(glsl_source, inputs, reduce_code) -> GPU::Kernel
  *
  * Raises GPU::CompileError carrying glslang's own output, so a bad block reads
  * like a Ruby error rather than a silent failure.
@@ -176,12 +213,18 @@ static void dispatch_kernel(VkPipeline pipeline,
  */
 static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
   const char *src;
-  mrb_int src_len;
-  mrb_get_args(mrb, "s", &src, &src_len);
+  mrb_int src_len, inputs, reduce;
+  mrb_get_args(mrb, "sii", &src, &src_len, &inputs, &reduce);
 
   struct RClass *gpu = mrb_module_get(mrb, "GPU");
   struct RClass *cerr = mrb_class_get_under(mrb, gpu, "CompileError");
 
+  if (inputs != 1 && inputs != 2) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "a kernel takes 1 or 2 inputs, got %i", inputs);
+  }
+  if (reduce < REDUCE_NONE || reduce > REDUCE_MAX) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "unknown reduction code %i", reduce);
+  }
   if (!g_ctx.initialized) {
     mrb_raise(mrb, E_RUNTIME_ERROR,
       "no Vulkan device yet -- create a GPU::NArray (or call GPU.info) first");
@@ -223,7 +266,7 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
     mrb_exc_raise(mrb, mrb_exc_new_str(mrb, cerr, msg));
   }
 
-  VkPipeline pipeline = pipeline_from_spv(spv_path);
+  VkPipeline pipeline = pipeline_from_spv(spv_path, kernel_layout((int)inputs));
   remove(comp_path);
   remove(log_path);
   remove(spv_path);
@@ -235,6 +278,8 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
 
   GpuKernel *k = (GpuKernel *)mrb_malloc(mrb, sizeof(GpuKernel));
   k->pipeline = pipeline;
+  k->inputs = (int)inputs;
+  k->reduce = (int)reduce;
 
   struct RObject *obj = (struct RObject *)mrb_obj_alloc(mrb, MRB_TT_CDATA,
                                                         mrb_class_ptr(self));
@@ -246,25 +291,82 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
   return kernel;
 }
 
-/* kernel.call(narray) -> narray -- run the kernel over every element. */
+/* kernel.call(a [, b]) -> GPU::NArray for an element-wise kernel, or the
+ * reduced Float for a reduction. */
 static mrb_value kernel_call(mrb_state *mrb, mrb_value self) {
-  mrb_value arg;
-  mrb_get_args(mrb, "o", &arg);
+  const mrb_value *argv;
+  mrb_int argc;
+  mrb_get_args(mrb, "*", &argv, &argc);
 
   GpuKernel *k = (GpuKernel *)DATA_GET_PTR(mrb, self, &gpu_kernel_type, GpuKernel);
 
-  if (mrb_type(arg) != MRB_TT_CDATA || DATA_TYPE(arg) != &gpu_buffer_type) {
-    mrb_raisef(mrb, E_TYPE_ERROR, "GPU::Kernel#call expects a GPU::NArray, got %s",
-               mrb_obj_classname(mrb, arg));
+  if (argc != k->inputs) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR,
+      "this kernel takes %i array(s) (its block has that many parameters), got %i",
+      (mrb_int)k->inputs, argc);
   }
-  GpuBuffer *a = (GpuBuffer *)DATA_PTR(arg);
-  GpuBuffer *b = create_buffer(mrb, a->n);
 
-  VkBuffer bufs[2]      = {a->buffer, b->buffer};
-  VkDeviceSize sizes[2] = {a->bytes,  b->bytes};
-  dispatch_kernel(k->pipeline, bufs, sizes, a->n, (a->n + 255) / 256);
+  /* Copy out of the VM stack before allocating anything. */
+  mrb_value args[2] = {mrb_nil_value(), mrb_nil_value()};
+  GpuBuffer *in[2] = {NULL, NULL};
+  for (mrb_int i = 0; i < argc; i++) {
+    args[i] = argv[i];
+    if (mrb_type(args[i]) != MRB_TT_CDATA || DATA_TYPE(args[i]) != &gpu_buffer_type) {
+      mrb_raisef(mrb, E_TYPE_ERROR, "GPU::Kernel#call expects a GPU::NArray, got %s",
+                 mrb_obj_classname(mrb, args[i]));
+    }
+    in[i] = (GpuBuffer *)DATA_PTR(args[i]);
+  }
+  if (k->inputs == 2 && in[0]->n != in[1]->n) {
+    mrb_raisef(mrb, E_ARGUMENT_ERROR, "shape mismatch: %i vs %i",
+               (mrb_int)in[0]->n, (mrb_int)in[1]->n);
+  }
 
-  return wrap_buffer(mrb, mrb_obj_class(mrb, arg), b);
+  uint32_t n = in[0]->n;
+  uint32_t groups = (n + 255) / 256;
+  LayoutId lid = kernel_layout(k->inputs);
+  VkBuffer bufs[3];
+  VkDeviceSize sizes[3];
+  for (int i = 0; i < k->inputs; i++) {
+    bufs[i] = in[i]->buffer;
+    sizes[i] = in[i]->bytes;
+  }
+
+  if (k->reduce == REDUCE_NONE) {
+    GpuBuffer *out = create_buffer(mrb, n);
+    /* Wrapped before dispatching: a Vulkan failure raises, and the GC can only
+     * free what it owns. */
+    mrb_value result = wrap_buffer(mrb, mrb_obj_class(mrb, args[0]), out);
+    bufs[k->inputs] = out->buffer;
+    sizes[k->inputs] = out->bytes;
+    dispatch_kernel(mrb, k->pipeline, lid, bufs, sizes, k->inputs + 1, n, groups);
+    return result;
+  }
+
+  /* Reduction: one partial per workgroup, combined here in double precision
+   * (the same arrangement as mruby-gpu-narray's #sum). */
+  if (n == 0) {
+    if (k->reduce == REDUCE_SUM) return mrb_float_value(mrb, 0.0);
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "min/max of an empty array");
+  }
+  GpuBuffer *partial = create_buffer(mrb, groups);
+  wrap_buffer(mrb, mrb_obj_class(mrb, args[0]), partial);   /* GC-owned scratch */
+  bufs[k->inputs] = partial->buffer;
+  sizes[k->inputs] = partial->bytes;
+  dispatch_kernel(mrb, k->pipeline, lid, bufs, sizes, k->inputs + 1, n, groups);
+
+  float *pm = map_buffer(mrb, partial);
+  double acc = (k->reduce == REDUCE_SUM) ? 0.0 : (double)pm[0];
+  for (uint32_t i = 0; i < groups; i++) {
+    double v = (double)pm[i];
+    switch (k->reduce) {
+      case REDUCE_SUM: acc += v; break;
+      case REDUCE_MIN: if (v < acc) acc = v; break;
+      case REDUCE_MAX: if (v > acc) acc = v; break;
+    }
+  }
+  unmap_buffer(partial);
+  return mrb_float_value(mrb, (mrb_float)acc);
 }
 
 void mrb_mruby_gpu_kernel_gem_init(mrb_state *mrb) {
@@ -273,8 +375,8 @@ void mrb_mruby_gpu_kernel_gem_init(mrb_state *mrb) {
 
   struct RClass *kernel = mrb_define_class_under(mrb, gpu, "Kernel", mrb->object_class);
   MRB_SET_INSTANCE_TT(kernel, MRB_TT_CDATA);
-  mrb_define_class_method(mrb, kernel, "compile", kernel_s_compile, MRB_ARGS_REQ(1));
-  mrb_define_method(mrb, kernel, "call", kernel_call, MRB_ARGS_REQ(1));
+  mrb_define_class_method(mrb, kernel, "compile", kernel_s_compile, MRB_ARGS_REQ(3));
+  mrb_define_method(mrb, kernel, "call", kernel_call, MRB_ARGS_ANY());
 }
 
 void mrb_mruby_gpu_kernel_gem_final(mrb_state *mrb) {
