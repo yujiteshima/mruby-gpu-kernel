@@ -1,5 +1,7 @@
 # mruby-gpu-kernel
 
+[![CI](https://github.com/yujiteshima/mruby-gpu-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/yujiteshima/mruby-gpu-kernel/actions/workflows/ci.yml)
+
 > **A Ruby block, compiled into a Vulkan compute shader.**
 > An add-on for [mruby-gpu-narray](https://github.com/yujiteshima/mruby-gpu-narray).
 
