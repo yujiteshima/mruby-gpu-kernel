@@ -69,19 +69,66 @@ void main() {
 ## API
 
 ```ruby
-a.map { |x| x * 2 + 1 }        # trace, compile, run -> a new GPU::SFloat
+a.map { |x| x * 2 + 1 }              # trace, compile, run -> a new GPU::SFloat
+a.map2(b) { |x, y| x * y + 1 }       # two inputs, one dispatch
+a.sum { |x| x * 2 + 1 }              # expression + reduction in one dispatch -> Float
+a.dot(b)                             # inner product, one dispatch -> Float
 
-k = GPU.kernel { |x| x * 2 }   # a reusable kernel; identical source compiles once
-k.call(a)
-k.glsl                         # the exact GLSL that was compiled
+k = GPU.kernel { |x| x * 2 }         # a reusable kernel; identical source compiles once
+k = GPU.kernel { |x, y| x - y }      # two inputs, from the block's arity (or arity: 2)
+k = GPU.kernel(reduce: :sum) { |x, y| x * y }   # :sum, :min or :max; #call returns a Float
+k.call(a)                            # or k.call(a, b)
+k.glsl                               # the exact GLSL that was compiled
+k.inputs                             # 1 or 2
+k.reduce                             # nil, :sum, :min or :max
 
-GPU.kernel_source { |x| x }    # trace only, no compilation (tests, slides)
+GPU.kernel_source { |x| x }          # trace only, no compilation (tests, slides)
 ```
 
 Inside a block you have GLSL's element-wise built-ins under their GLSL names: `sin`,
 `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`, `log`,
 `log2`, `sqrt`, `inversesqrt`, `abs`, `sign`, `floor`, `ceil`, `fract`, `radians`,
 `degrees`, `min`, `max`, `pow`, `mod`, `step`, `clamp`, `mix`, `smoothstep`.
+
+### Control flow: where and iterate
+
+Ruby's own `if`, `while`, `&&` and `||` cannot be traced. The block runs once with a
+proxy, and a proxy is always truthy, so `if x > 0` would take the same branch for every
+element and `while` would never end. The shader gets its control flow from two
+functions instead:
+
+```ruby
+a.map { |x| where(x > 0, x, 0) }                     # branch: GLSL's `cond ? a : b`
+a.map { |x| where((x > -2) & (x < 2), x, 0) }        # combine conditions with & | !
+a.map { |x| iterate(x, 20) { |g, i| (g + x / g) * 0.5 } }   # loop: a real GLSL `for`
+```
+
+- Comparisons (`> < >= <= == !=`) produce a *condition*, which only `where`, `&`, `|` and
+  `!` accept. Using one in arithmetic raises `TypeError` before glslang ever sees it.
+- `&` and `|` bind tighter than comparisons in Ruby, so parenthesise: `(x > 1) & (x < 3)`.
+- `iterate(init, count) { |acc, i| ... }` runs the block `count` times with `acc`
+  carrying the value across rounds; `i` is the round number as a float. `count` must be
+  an Integer when the block is traced -- a loop bound that depends on the data is not
+  expressible. Loops nest.
+- A Ruby loop with a count known at trace time -- `3.times { y = y * 2 }` -- needs no
+  special support: it is simply unrolled into the expression.
+
+```glsl
+    float x = a[idx];
+    float acc1 = x;
+    for (int i2 = 0; i2 < 20; i2++) {
+        acc1 = ((acc1 + (x / acc1)) * 0.5);
+    }
+    b[idx] = acc1;
+```
+
+### Reductions
+
+`a.sum { |x| ... }` and `GPU.kernel(reduce: :sum | :min | :max)` evaluate the block per
+element and reduce inside the same shader: a tree reduction in workgroup shared memory,
+one partial per 256-element workgroup, and the partials combined on the host in double
+precision -- the same arrangement as the base gem's `#sum`. Compared with
+`a.map { }.sum` that is one dispatch instead of two and no intermediate array.
 
 ### Two rules
 
@@ -93,9 +140,9 @@ Inside a block you have GLSL's element-wise built-ins under their GLSL names: `s
 
 ### Not yet
 
-One input and one output, element-wise only. No control flow, no reductions, no
-multi-array kernels. A shader that fails to compile raises `GPU::CompileError` carrying
-glslang's own message.
+At most two inputs and one output. No loop whose count depends on the data, no
+indexing into neighbouring elements, no 2-D. A shader that fails to compile raises
+`GPU::CompileError` carrying glslang's own message.
 
 ## Requirements
 
@@ -128,6 +175,7 @@ end
 cd /path/to/mruby && MRUBY_CONFIG=/path/to/mruby-gpu-kernel/build_config.reference.rb rake
 ./build/host/bin/mruby /path/to/mruby-gpu-kernel/test/kernel_test.rb    # ALL TESTS PASSED
 ./build/host/bin/mruby /path/to/mruby-gpu-kernel/examples/kernel_dsl.rb
+./build/host/bin/mruby /path/to/mruby-gpu-kernel/examples/kernel_dsl_2.rb   # map2, sum {}, where, iterate
 ```
 
 To develop against a local checkout of the base gem instead of the published one, list
@@ -136,10 +184,10 @@ it before this gem in `build_config.rb`.
 ## How it fits together
 
 ```
-mrblib/gpu_kernel.rb   Expr / KernelContext / GPU.kernel / NArray#map
-   │                   block -> expression tree -> GLSL
+mrblib/gpu_kernel.rb   Expr / Codegen / KernelContext / GPU.kernel / NArray#map, #map2, #sum, #dot
+   │                   block -> expression tree -> GLSL (statements for loops, an expression for the rest)
    ▼
-src/gpu_kernel.c       GPU::Kernel: glslangValidator -> SPIR-V -> VkPipeline -> dispatch
+src/gpu_kernel.c       GPU::Kernel: glslangValidator -> SPIR-V -> VkPipeline -> dispatch (2 or 3 buffers)
    │
    ├─ uses mruby-gpu-narray's g_ctx (device, queue, layouts, pools)
    └─ uses its create_buffer / wrap_buffer / gpu_buffer_type
@@ -153,7 +201,7 @@ pipeline-taking variant, this copy should go away.
 
 ## Verified on
 
-- **macOS** — Apple M5 GPU via MoltenVK, Vulkan 1.1: 20/20 tests pass.
+- **macOS** — Apple M5 GPU via MoltenVK, Vulkan 1.1: 58/58 tests pass.
 - **Raspberry Pi 5** — not yet run.
 
 ## License
