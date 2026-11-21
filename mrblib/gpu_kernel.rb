@@ -411,10 +411,6 @@ module GPU
     source = trace(inputs, reduce, &block)
     @kernel_cache ||= {}
     @kernel_cache[source] ||= begin
-      # mruby-gpu-narray brings Vulkan up lazily on its first operation and
-      # keeps that entry point private to its C code, so reach it through a
-      # public call before compiling. Only runs on a cache miss.
-      GPU.info
       k = Kernel.compile(source, inputs, reduce ? Kernel::REDUCE[reduce][2] : 0)
       k.instance_variable_set(:@inputs, inputs)
       k.instance_variable_set(:@reduce, reduce)

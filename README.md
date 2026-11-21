@@ -169,8 +169,8 @@ The only link dependency is the Vulkan loader (`-lvulkan`).
 
 ## Build
 
-Add just this gem — `mruby-gpu-narray` comes along as a dependency, resolved through
-mgem-list:
+Add just this gem. Its dependencies come along: `mruby-gpu-narray`, resolved through
+mgem-list, and `mruby-gpu-runtime`, fetched from GitHub:
 
 ```ruby
 MRuby::Build.new do |conf|
@@ -191,8 +191,8 @@ cd /path/to/mruby && MRUBY_CONFIG=/path/to/mruby-gpu-kernel/build_config.referen
 ./build/host/bin/mruby /path/to/mruby-gpu-kernel/examples/kernel_dsl_2.rb   # map2, sum {}, where, iterate
 ```
 
-To develop against a local checkout of the base gem instead of the published one, list
-it before this gem in `build_config.rb`.
+To develop against a local checkout of mruby-gpu-narray or mruby-gpu-runtime instead of
+the published one, list it before this gem in `build_config.rb`.
 
 ## How it fits together
 
@@ -200,19 +200,22 @@ it before this gem in `build_config.rb`.
 mrblib/gpu_kernel.rb   Expr / Codegen / KernelContext / GPU.kernel / NArray#map, #map2, #sum, #dot
    │                   block -> expression tree -> GLSL (statements for loops, an expression for the rest)
    ▼
-src/gpu_kernel.c       GPU::Kernel: glslangValidator -> SPIR-V -> VkPipeline -> dispatch_pipeline (2 or 3 buffers)
+src/gpu_kernel.c       GPU::Kernel: glslangValidator -> SPIR-V -> gpu_rt_pipeline -> gpu_rt_dispatch (2 or 3 buffers)
    │
-   ├─ uses mruby-gpu-narray's g_ctx (device, queue, layouts, pools)
-   ├─ uses its create_buffer / wrap_buffer / gpu_buffer_type
-   └─ dispatches through its dispatch_pipeline() (same batch as the operators)
+   ▼
+mruby-gpu-runtime      its C API, <gpu_runtime.h>:
+   ├─ gpu_rt_pipeline_create   the pipeline, from the SPIR-V
+   ├─ gpu_rt_buffer_check      the GPU::NArray passed in from Ruby
+   ├─ gpu_rt_buffer_create / gpu_rt_buffer_wrap   the result array
+   └─ gpu_rt_dispatch          into the batch the operators share
 ```
 
-This gem compiles against the base gem's `src/gpu_internal.h` and links against symbols
-it already exports. A kernel is dispatched through the base gem's `dispatch_pipeline()`,
-so it is recorded into the same deferred batch as the built-in operators: `a.map { … }`
-queues one dispatch, and nothing is submitted until a result is read. This needs a
-`mruby-gpu-narray` that exports `dispatch_pipeline()` (its `deferred-submit` branch or
-later).
+This gem includes only [mruby-gpu-runtime](https://github.com/yujiteshima/mruby-gpu-runtime)'s
+`gpu_runtime.h` and does not call Vulkan itself. A kernel is dispatched through
+`gpu_rt_dispatch()`, so it is recorded into the same deferred batch as
+mruby-gpu-narray's built-in operators: `a.map { … }` queues one dispatch, and nothing is
+submitted until a result is read. mruby-gpu-narray supplies the `GPU::NArray` classes the
+kernels work on. The build fetches both gems unless `build_config.rb` already lists them.
 
 ## Verified on
 

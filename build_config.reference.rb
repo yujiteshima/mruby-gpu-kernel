@@ -1,7 +1,8 @@
 # Reference build_config.rb for mruby-gpu-kernel.
 #
-# Only this gem is listed: mruby-gpu-narray is pulled in automatically as a
-# dependency, resolved through mgem-list (mruby's official gem catalog).
+# Only this gem is listed. Its dependencies are pulled in automatically:
+# mruby-gpu-narray through mgem-list (mruby's official gem catalog), and
+# mruby-gpu-runtime from GitHub.
 #
 # Usage:
 #   cd /path/to/mruby
