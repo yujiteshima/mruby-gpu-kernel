@@ -77,7 +77,8 @@ static uint8_t *read_file(const char *path, size_t *size) {
 /* GPU::Kernel.compile(glsl_source, inputs, reduce_code) -> GPU::Kernel
  *
  * Raises GPU::CompileError carrying glslang's own output, so a bad block reads
- * like a Ruby error rather than a silent failure.
+ * like a Ruby error rather than a silent failure. The class is
+ * mruby-gpu-runtime's, a GPU::Error.
  *
  * Starts the device if nothing has used the GPU yet.
  */
@@ -86,8 +87,7 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
   mrb_int src_len, inputs, reduce;
   mrb_get_args(mrb, "sii", &src, &src_len, &inputs, &reduce);
 
-  struct RClass *gpu = mrb_module_get(mrb, "GPU");
-  struct RClass *cerr = mrb_class_get_under(mrb, gpu, "CompileError");
+  struct RClass *cerr = gpu_rt_error_class(mrb, GPU_RT_ERROR_COMPILE);
 
   if (inputs != 1 && inputs != 2) {
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "a kernel takes 1 or 2 inputs, got %i", inputs);
@@ -111,7 +111,7 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
            tmpdir, (long)getpid(), id);
 
   FILE *f = fopen(comp_path, "wb");
-  if (!f) mrb_raisef(mrb, E_RUNTIME_ERROR, "cannot write %s", comp_path);
+  if (!f) mrb_raisef(mrb, cerr, "cannot write %s", comp_path);
   fwrite(src, 1, (size_t)src_len, f);
   fclose(f);
 
@@ -145,7 +145,9 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
 
   /* (a, out) or (a, b, out), and { uint n; } as push constants. The error
    * struct makes the runtime report a shader the device refuses instead of
-   * raising, so that it becomes a GPU::CompileError like any other bad block. */
+   * raising, so that the message can say the GLSL itself compiled. The class
+   * is the one the runtime names: GPU::CompileError like any other bad block,
+   * unless the VkResult is about memory, the device or a missing feature. */
   gpu_rt_layout layout = {
     .storage_buffers = (uint32_t)inputs + 1,
     .push_constant_size = sizeof(uint32_t)
@@ -159,7 +161,8 @@ static mrb_value kernel_s_compile(mrb_state *mrb, mrb_value self) {
     snprintf(msg, sizeof(msg),
       "SPIR-V compiled but the compute pipeline could not be created: "
       "%s failed: %s (VkResult %d)", err.operation, err.reason, (int)err.vk_result);
-    mrb_exc_raise(mrb, mrb_exc_new_str(mrb, cerr, mrb_str_new_cstr(mrb, msg)));
+    mrb_exc_raise(mrb, mrb_exc_new_str(mrb, gpu_rt_error_class(mrb, err.kind),
+                                       mrb_str_new_cstr(mrb, msg)));
   }
 
   GpuKernel *k = (GpuKernel *)mrb_malloc(mrb, sizeof(GpuKernel));
@@ -206,7 +209,7 @@ static mrb_value kernel_call(mrb_state *mrb, mrb_value self) {
     len[i] = (uint32_t)(gpu_rt_buffer_size(mrb, in[i]) / sizeof(float));
   }
   if (k->inputs == 2 && len[0] != len[1]) {
-    mrb_raisef(mrb, E_ARGUMENT_ERROR, "shape mismatch: %i vs %i",
+    mrb_raisef(mrb, gpu_rt_error_class(mrb, GPU_RT_ERROR_SHAPE), "shape mismatch: %i vs %i",
                (mrb_int)len[0], (mrb_int)len[1]);
   }
 
@@ -266,13 +269,8 @@ void mrb_mruby_gpu_kernel_gem_init(mrb_state *mrb) {
   gpu_rt_require(mrb, 0, 1);
 
   struct RClass *gpu = mrb_define_module(mrb, "GPU");
-  /* mruby-gpu-runtime defines GPU::CompileError under GPU::Error once it has
-   * the GPU::Error hierarchy (mruby-gpu-runtime#5). Defining it again with
-   * another superclass would raise, so it is defined here only when the
-   * runtime has not: this file works with a runtime from before and after. */
-  if (!mrb_class_defined_under(mrb, gpu, "CompileError")) {
-    mrb_define_class_under(mrb, gpu, "CompileError", mrb_class_get(mrb, "StandardError"));
-  }
+  /* GPU::CompileError and the other exception classes are
+   * mruby-gpu-runtime's (gpu_rt_error_class). */
 
   struct RClass *kernel = mrb_define_class_under(mrb, gpu, "Kernel", mrb->object_class);
   MRB_SET_INSTANCE_TT(kernel, MRB_TT_CDATA);

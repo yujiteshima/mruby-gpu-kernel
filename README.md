@@ -155,7 +155,9 @@ precision -- the same arrangement as the base gem's `#sum`. Compared with
 
 At most two inputs and one output. No loop whose count depends on the data, no
 indexing into neighbouring elements, no 2-D. A shader that fails to compile raises
-`GPU::CompileError` carrying glslang's own message.
+`GPU::CompileError` carrying glslang's own message. It is a `GPU::Error`, like
+every failure of the device or the driver; the classes are mruby-gpu-runtime's.
+Two arrays of different sizes raise `GPU::ShapeError`, which is an `ArgumentError`.
 
 ## Requirements
 
