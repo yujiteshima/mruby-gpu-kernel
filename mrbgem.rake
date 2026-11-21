@@ -1,7 +1,7 @@
 MRuby::Gem::Specification.new('mruby-gpu-kernel') do |spec|
   spec.license = 'MIT'
   spec.authors = 'Yuji Teshima'
-  spec.version = '0.1.0'
+  spec.version = '0.2.0'
   spec.summary = 'Trace a Ruby block into a Vulkan compute shader for mruby-gpu-narray'
 
   # Resolved from mgem-list when no source is given (lib/mruby/gem.rb:
