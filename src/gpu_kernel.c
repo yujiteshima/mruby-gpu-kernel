@@ -266,7 +266,13 @@ void mrb_mruby_gpu_kernel_gem_init(mrb_state *mrb) {
   gpu_rt_require(mrb, 0, 1);
 
   struct RClass *gpu = mrb_define_module(mrb, "GPU");
-  mrb_define_class_under(mrb, gpu, "CompileError", mrb_class_get(mrb, "StandardError"));
+  /* mruby-gpu-runtime defines GPU::CompileError under GPU::Error once it has
+   * the GPU::Error hierarchy (mruby-gpu-runtime#5). Defining it again with
+   * another superclass would raise, so it is defined here only when the
+   * runtime has not: this file works with a runtime from before and after. */
+  if (!mrb_class_defined_under(mrb, gpu, "CompileError")) {
+    mrb_define_class_under(mrb, gpu, "CompileError", mrb_class_get(mrb, "StandardError"));
+  }
 
   struct RClass *kernel = mrb_define_class_under(mrb, gpu, "Kernel", mrb->object_class);
   MRB_SET_INSTANCE_TT(kernel, MRB_TT_CDATA);
