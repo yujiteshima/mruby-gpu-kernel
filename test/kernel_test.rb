@@ -128,6 +128,15 @@ assert_true("two-input source loads y from the second buffer",
 assert_raise("map2 with mismatched sizes -> ArgumentError", ArgumentError) do
   GPU::SFloat[1, 2, 3].map2(GPU::SFloat[1, 2]) { |x, y| x + y }
 end
+assert_raise("map2 with mismatched sizes -> GPU::ShapeError", GPU::ShapeError) do
+  GPU::SFloat[1, 2, 3].map2(GPU::SFloat[1, 2]) { |x, y| x + y }
+end
+assert_raise("GLSL that does not compile -> GPU::CompileError", GPU::CompileError) do
+  GPU::Kernel.compile("this is not GLSL", 1, 0)
+end
+assert_raise("and GPU::CompileError is a GPU::Error", GPU::Error) do
+  GPU::Kernel.compile("this is not GLSL", 1, 0)
+end
 assert_raise("two-input kernel called with one array -> ArgumentError", ArgumentError) do
   GPU.kernel { |x, y| x + y }.call(GPU::SFloat[1, 2])
 end
